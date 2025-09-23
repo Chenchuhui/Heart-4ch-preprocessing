@@ -1,18 +1,26 @@
+#!/usr/bin/env python3
+"""
+Merge per-structure NIfTI masks inside each case folder into one labeled volume.
+
+Usage:
+  python merge_masks.py --input ./CAS/ImageCAS_heart_masks --output ./CAS/ImageCAS_heart_compact_masks
+  # Optional:
+  #   --overwrite   : replace existing outputs
+  #   --workers N   : parallel workers (default: CPU-1)
+
+Edit LABEL_MAP below if your filenames/labels change.
+"""
+
 import os
+import argparse
+from pathlib import Path
+from concurrent.futures import ProcessPoolExecutor, as_completed
+
 import nibabel as nib
 import numpy as np
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 
-# ---------- CONFIG ----------
-BASE_DIR = r"./CAS/ImageCAS_heart_masks"
-OUT_ROOT = r"./CAS/ImageCAS_heart_compact_masks"
-os.makedirs(OUT_ROOT, exist_ok=True)
-
-# Use processes (bypass GIL, faster if CPU-bound) or threads (lower RAM)
-USE_PROCESSES = True
-MAX_WORKERS = max(1, (os.cpu_count() or 4) - 1)  # leave one core free
-
-# Map filenames (inside each case folder) -> desired label value
+# ---------- EDIT ME IF NEEDED ----------
+# Map: filename in each case folder -> integer label
 LABEL_MAP = {
     "aorta.nii.gz": 1,
     "heart_atrium_left.nii.gz": 2,
@@ -22,114 +30,125 @@ LABEL_MAP = {
     "heart_ventricle_right.nii.gz": 6,
     "pulmonary_artery.nii.gz": 7,
 }
+OUT_NAME_TEMPLATE = "{case}_merge.nii.gz"
+MASK_THRESHOLD = 0.0          # voxel is foreground if > this
+OUTPUT_DTYPE   = np.int16     # output label dtype
+# ---------------------------------------
 
-def combine_folder(case_dir: str, case_name: str, label_map: dict, out_root: str):
-    """
-    Combine individual structure masks in one folder into a single label NIfTI.
-    Returns a (case_name, success_bool, log_text).
-    """
+
+def _find_file(case_dir: Path, name: str) -> Path | None:
+    """Find name as-is, or swap .nii<->.nii.gz."""
+    p = case_dir / name
+    if p.exists():
+        return p
+    if name.endswith(".nii.gz"):
+        q = case_dir / name[:-3]  # .nii
+        return q if q.exists() else None
+    if name.endswith(".nii"):
+        q = case_dir / (name + ".gz")  # .nii.gz
+        return q if q.exists() else None
+    return None
+
+
+def _combine_one_case(case_dir: Path, out_root: Path, overwrite: bool) -> tuple[str, bool, str]:
     logs = [f"Processing: {case_dir}"]
+    case_name = case_dir.name
+    out_path = out_root / OUT_NAME_TEMPLATE.format(case=case_name)
 
-    out_name = f"{case_name.split('.', 1)[0]}_merge.nii.gz"
-    out_path = os.path.join(out_root, out_name)
-    if os.path.exists(out_path):
-        logs.append(f"  ⏭️ Skipped (already exists): {out_path}")
+    if out_path.exists() and not overwrite:
+        logs.append(f"  ⏭️  Skipped (already exists): {out_path}")
         return case_name, True, "\n".join(logs)
 
-    # Find a reference file to get shape & affine
+    # pick the first existing file as reference (to get shape/affine)
     ref_path = None
-    for fname in label_map.keys():
-        p = os.path.join(case_dir, fname)
-        if os.path.exists(p):
-            ref_path = p
-            break
-        if fname.endswith(".nii.gz"):
-            p2 = os.path.join(case_dir, fname[:-3])  # try ".nii"
-            if os.path.exists(p2):
-                ref_path = p2
-                break
+    ordered_files = []
+    for fname, lbl in LABEL_MAP.items():
+        fpath = _find_file(case_dir, fname)
+        ordered_files.append((fname, lbl, fpath))
+        if ref_path is None and fpath is not None:
+            ref_path = fpath
 
     if ref_path is None:
-        logs.append(f"⚠️  No expected mask files found in: {case_dir} — skipped.")
+        logs.append("  ⚠️  No expected mask files found — skipped.")
         return case_name, False, "\n".join(logs)
 
     try:
-        ref_img = nib.load(ref_path)
-        shape   = ref_img.shape
-        affine  = ref_img.affine
-        combined = np.zeros(shape, dtype=np.int16)
+        ref_img = nib.load(str(ref_path))
+        shape, affine = ref_img.shape, ref_img.affine
+        combined = np.zeros(shape, dtype=OUTPUT_DTYPE)
 
-        # Fill the combined array
-        for fname, label_val in label_map.items():
-            candidates = [fname]
-            if fname.endswith(".nii.gz"):
-                candidates.append(fname[:-3])   # also try ".nii"
-            elif fname.endswith(".nii"):
-                candidates.append(fname + ".gz")
-
-            found = None
-            for cand in candidates:
-                fpath = os.path.join(case_dir, cand)
-                if os.path.exists(fpath):
-                    found = fpath
-                    break
-
-            if not found:
-                logs.append(f"  ⚠️ Missing file: {fname} in {case_dir} (skipped this label)")
+        applied = 0
+        for fname, label_val, fpath in ordered_files:
+            if fpath is None:
+                logs.append(f"  ⚠️ Missing: {fname}")
                 continue
 
-            seg_img = nib.load(found)
-            seg = seg_img.get_fdata()
+            try:
+                img = nib.load(str(fpath))
+                seg = img.get_fdata()
 
-            if seg.shape != shape:
-                logs.append(f"  ❌ Shape mismatch for {found}: got {seg.shape}, expected {shape}. Skipping this file.")
-                continue
+                if seg.shape != shape:
+                    logs.append(f"  ❌ Shape mismatch for {fname}: {seg.shape} vs {shape} (skipped)")
+                    continue
 
-            seg_bin = (seg > 0).astype(np.int16)
-            combined[seg_bin == 1] = label_val
+                mask = seg > MASK_THRESHOLD
+                combined[mask] = label_val
+                applied += 1
+            except Exception as e:
+                logs.append(f"  ❌ Failed to read/apply {fname}: {e}")
+
+        if applied == 0:
+            logs.append("  ⚠️  No masks applied — skipped.")
+            return case_name, False, "\n".join(logs)
 
         out_img = nib.Nifti1Image(combined, affine)
         out_img.set_qform(affine, code=1)
         out_img.set_sform(affine, code=1)
-        nib.save(out_img, out_path)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        nib.save(out_img, str(out_path))
         logs.append(f"  ✅ Saved: {out_path}")
         return case_name, True, "\n".join(logs)
+
     except Exception as e:
         logs.append(f"  💥 Error: {e}")
         return case_name, False, "\n".join(logs)
 
-def list_cases(base_dir: str):
-    cases = []
-    for name in sorted(os.listdir(base_dir)):
-        case_dir = os.path.join(base_dir, name)
-        if os.path.isdir(case_dir):
-            cases.append((case_dir, name))
-    return cases
+
+def _list_cases(root: Path) -> list[Path]:
+    return [p for p in sorted(root.iterdir()) if p.is_dir()]
+
 
 def main():
-    cases = list_cases(BASE_DIR)
+    parser = argparse.ArgumentParser(description="Merge structure masks per case into one labeled NIfTI.")
+    parser.add_argument("--input", "-i", required=True, type=Path, help="Root folder containing case subfolders.")
+    parser.add_argument("--output", "-o", required=True, type=Path, help="Output folder.")
+    parser.add_argument("--overwrite", action="store_true", help="Overwrite existing outputs.")
+    parser.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 4) - 1),
+                        help="Parallel workers (default: CPU-1).")
+    args = parser.parse_args()
+
+    in_root: Path = args.input
+    out_root: Path = args.output
+    out_root.mkdir(parents=True, exist_ok=True)
+
+    cases = _list_cases(in_root)
     if not cases:
-        print(f"No case folders found under: {BASE_DIR}")
+        print(f"No case folders found under: {in_root}")
         return
 
-    print(f"Found {len(cases)} case(s). Writing to: {OUT_ROOT}")
-    Executor = ProcessPoolExecutor if USE_PROCESSES else ThreadPoolExecutor
+    print(f"Found {len(cases)} case(s). Writing to: {out_root}")
 
-    futures = []
-    with Executor(max_workers=MAX_WORKERS) as ex:
-        for case_dir, name in cases:
-            futures.append(
-                ex.submit(combine_folder, case_dir, name, LABEL_MAP, OUT_ROOT)
-            )
-
-        succeeded = 0
+    ok_count = 0
+    with ProcessPoolExecutor(max_workers=args.workers) as ex:
+        futures = [ex.submit(_combine_one_case, c, out_root, args.overwrite) for c in cases]
         for fut in as_completed(futures):
-            case_name, ok, log_text = fut.result()
-            print(log_text)
+            case_name, ok, log = fut.result()
+            print(log, flush=True)
             if ok:
-                succeeded += 1
+                ok_count += 1
 
-    print(f"\nDone. {succeeded}/{len(cases)} case(s) processed or skipped successfully.")
+    print(f"\nDone. {ok_count}/{len(cases)} case(s) processed or skipped successfully.")
+
 
 if __name__ == "__main__":
     main()
