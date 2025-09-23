@@ -1,4 +1,3 @@
-````markdown
 # Cardiac Mask Processing Toolkit
 
 This repository contains two Python command-line tools for processing cardiac medical imaging data (NIfTI).  
@@ -15,10 +14,10 @@ Both scripts use [nibabel](https://nipy.org/nibabel/), [numpy](https://numpy.org
 Clone this repo and install dependencies:
 
 ```bash
-git clone https://github.com/Chenchuhui/cardiac-preprocessing.git
+git clone https://github.com/yourname/cardiac-processing.git
 cd cardiac-processing
 pip install -r requirements.txt
-````
+```
 
 Example `requirements.txt`:
 
