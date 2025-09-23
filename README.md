@@ -1,4 +1,4 @@
-Follow the step 1, 2, 3, 4.
+Follow the step 1, 2.
 
 Edit your own path to the dataset
 
