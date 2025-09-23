@@ -174,5 +174,3 @@ File naming:
 * Ensure labels follow consistent IDs (`LBL_LV=5, LBL_RV=6, ...`) — edit the script header if your dataset differs.
 
 ```
-
----
