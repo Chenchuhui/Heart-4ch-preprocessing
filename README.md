@@ -172,5 +172,3 @@ File naming:
 * Largest connected component is automatically chosen to reduce noise.
 * If paired images exist, they will be resampled to the same space as labels.
 * Ensure labels follow consistent IDs (`LBL_LV=5, LBL_RV=6, ...`) — edit the script header if your dataset differs.
-
-```
